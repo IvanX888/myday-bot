@@ -61,11 +61,13 @@ def tg_file(method, file_field, file_bytes, filename, **params):
         return {}
 
 def send(chat, text, kb=None):
-    params = {"chat_id": chat, "text": text, "parse_mode": "HTML"}
+    params = {"chat_id": chat, "text": text}
     if kb:
-        import json as _j
-        params["reply_markup"] = _j.dumps(kb)
-    return tg("sendMessage", **params)
+        params["reply_markup"] = json.dumps(kb, ensure_ascii=False)
+    r = tg("sendMessage", **params)
+    if r and not r.get("ok"):
+        log.warning(f"sendMessage fail: {r.get('description')} | {text[:60]!r}")
+    return r
 
 def send_voice(chat, text):
     from gtts import gTTS
@@ -218,7 +220,7 @@ def handle_command(d, uid, chat, text):
         code = str(random.randint(1000, 9999))
         d["links"][code] = {"uid": uid, "exp": (datetime.now() + timedelta(minutes=10)).isoformat()}
         save_data(d)
-        send(chat, f"🔑 Код для семьи: <b>{code}</b>\nДействует 10 минут. Родной человек пишет мне: /link {code}")
+        send(chat, f"🔑 Код для семьи: {code}\nДействует 10 минут. Родной человек пишет мне: /link {code}")
         return True
     if text.startswith("/link"):
         parts = text.split()
@@ -259,22 +261,20 @@ def handle_message(d, msg):
     chat = msg["chat"]["id"]
     text = msg.get("text", "")
     if text:
-        # помощник?
         helper_of = next((k for k, v in d["users"].items() if uid in v.get("helpers", [])), None)
         if helper_of and not text.startswith("/"):
             ttext, due, dl, tid = add_task(d, helper_of, text, "helper")
             save_data(d)
             send(chat, f"✔ Передал: {ttext} ({dl} в {due.strftime('%H:%M')})")
-            send(helper_of, f"📌 Новая задача от семьи: <b>{ttext}</b>\n{dl} в {due.strftime('%H:%M')}",
+            send(helper_of, f"📌 Новая задача от семьи: {ttext}\n{dl} в {due.strftime('%H:%M')}",
                  kb=kb_task(tid))
             return
         if text.startswith("/"):
             if handle_command(d, uid, chat, text.split("@")[0]):
                 return
-        # обычная задача текстом
         ttext, due, dl, tid = add_task(d, uid, text, "self")
         save_data(d)
-        send(chat, f"📌 <b>{ttext}</b>\n{dl} в {due.strftime('%H:%M')}", kb=kb_task(tid))
+        send(chat, f"📌 {ttext}\n{dl} в {due.strftime('%H:%M')}", kb=kb_task(tid))
         if SEND_VOICE:
             try:
                 send_voice(chat, f"Добавлено: {ttext}. {dl} в {due.strftime('%H:%M')}.")
@@ -286,12 +286,15 @@ def handle_message(d, msg):
             text = transcribe_voice(msg["voice"]["file_id"])
         except Exception as e:
             log.warning(f"STT: {e}")
-            send(chat, "⚠️ Не разобрал голос. Напишите текстом или продиктуйте чётче.")
+            if "aifc" in str(e) or "audioop" in str(e):
+                send(chat, "⚠️ Голос пока не работает: в Termux выполни pip install -U SpeechRecognition и перезапусти бота.")
+            else:
+                send(chat, "⚠️ Не разобрал голос. Напишите текстом или продиктуйте чётче.")
             return
         send(chat, f"🎤 Распознал: «{text}»")
         ttext, due, dl, tid = add_task(d, uid, text, "self")
         save_data(d)
-        send(chat, f"📌 <b>{ttext}</b>\n{dl} в {due.strftime('%H:%M')}", kb=kb_task(tid))
+        send(chat, f"📌 {ttext}\n{dl} в {due.strftime('%H:%M')}", kb=kb_task(tid))
 
 def handle_callback(d, cb):
     uid = str(cb["from"]["id"])
@@ -343,14 +346,13 @@ def scheduler_tick(d):
             last = datetime.fromisoformat(t["last_fire"]) if t["last_fire"] else None
             if now >= due and (last is None or (now - last).total_seconds() >= repeat_minutes(u) * 60):
                 t["status"] = "overdue"; t["last_fire"] = now.isoformat(); changed = True
-                send(int(k), f"🔔 <b>{t['text']}</b>\nПора! Повторяю каждые {repeat_minutes(u)} мин, пока не подтвердите.",
+                send(int(k), f"🔔 {t['text']}\nПора! Повторяю каждые {repeat_minutes(u)} мин, пока не подтвердите.",
                      kb=kb_task(t["id"]))
                 if SEND_VOICE:
                     try:
                         send_voice(int(k), f"Напоминаю: {t['text']}")
                     except Exception as e:
                         log.warning(f"TTS: {e}")
-        # отчёт помощникам в 21:00
         if now.strftime("%H:%M") == "21:00" and u["tasks"] and not u.get("_rep_" + now.strftime("%d%m")):
             done = sum(1 for t in u["tasks"] if t["done"])
             for h in u.get("helpers", []):
@@ -388,7 +390,6 @@ def main():
             if time.time() - last_check >= CHECK_SEC:
                 last_check = time.time()
                 scheduler_tick(d)
-            # раз в сутки чистим старые выполненные задачи
             if datetime.now().date() != last_save_day:
                 last_save_day = datetime.now().date()
                 for u in d["users"].values():
