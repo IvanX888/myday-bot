@@ -1,0 +1,4 @@
+aiogram==3.13.1
+gTTS==2.5.3
+SpeechRecognition==3.10.4
+soundfile==0.12.1
