@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Мой день — бот-напоминалка и семейный задачник (Termux-friendly, без компиляции).
-Зависимости: pip install -r requirements.txt; системные: ffmpeg, flac (для голоса).
+Мой день — Telegram-бот напоминаний (версия без aiogram — работает на Termux без компиляции).
+Установка: pip install -r requirements.txt   (нужен ffmpeg для голосовых)
 Запуск: BOT_TOKEN=токен python bot.py
 """
 import os, json, re, time, logging, tempfile, subprocess, threading
@@ -21,7 +21,6 @@ log = logging.getLogger("myday")
 
 # ================== ХРАНИЛИЩЕ ==================
 STORE_LOCK = threading.Lock()
-
 def load_data():
     try:
         with open(DATA_FILE, encoding="utf-8") as f:
@@ -38,23 +37,16 @@ def save_data(d):
 
 def new_profile(name):
     return {"name": name, "username": None, "active": None, "tasks": [],
-            "repeat": 30, "shared": False,
+            "snooze": 15, "repeat": 30, "shared": False,
             "helpers": [], "created": datetime.now().isoformat()}
 
+# ---- активный задачник ----
 def active_owner(d, uid):
-    """Чей задачник активен. 'self' = свой. None = по умолчанию
-    (обычный юзер — свой, помощник — хозяина)."""
     u = d["users"].get(uid, {})
     a = u.get("active")
-    if a == "self":
-        return uid
-    if a and a in d["users"]:
+    if a and a in d["users"] and (a == uid or uid in d["users"][a].get("helpers", [])):
         return a
-    h = next((k for k, v in d["users"].items() if uid in v.get("helpers", [])), None)
-    return h or uid
-
-def own_mode(d, uid):
-    return d["users"].get(uid, {}).get("active") == "self"
+    return uid
 
 def accessible(d, uid):
     acc = [(uid, d["users"].get(uid, new_profile("Я"))["name"])]
@@ -63,21 +55,7 @@ def accessible(d, uid):
             acc.append((k, v["name"]))
     return acc
 
-def name_match(name, real_name):
-    """Нечёткое сопоставление: 'дяди' найдёт 'Дядя Валера'."""
-    name = name.lower().strip()
-    nml = real_name.lower()
-    if not name:
-        return False
-    if name in nml or nml in name:
-        return True
-    w = name.split()[0]
-    for x in nml.split():
-        if len(x) >= 3 and len(w) >= 3 and (x.startswith(w[:4]) or w.startswith(x[:4])):
-            return True
-    return False
-
-# ================== TELEGRAM API ==================
+# ================== TELEGRAM API (через requests) ==================
 def tg(method, **params):
     for attempt in range(3):
         try:
@@ -90,8 +68,9 @@ def tg(method, **params):
 
 def tg_file(method, file_field, file_bytes, filename, **params):
     try:
-        r = requests.post(f"{API}/{method}", data=params,
-                          files={file_field: (filename, file_bytes)}, timeout=60)
+        r = requests.post(f"{API}/{method}",
+                          data=params, files={file_field: (filename, file_bytes)},
+                          timeout=60)
         return r.json()
     except Exception as e:
         log.warning(f"{method}: {e}")
@@ -107,6 +86,60 @@ def send(chat, text, kb=None, rkb=None):
         log.warning(f"sendMessage fail: {r.get('description')} | {text[:60]!r}")
     return r
 
+# главное меню-подсказка под полем ввода (как в боте-юристе)
+def main_kb():
+    return {"keyboard": [
+        [{"text": "📋 Мои задачи"}, {"text": "📊 Отчёт"}],
+        [{"text": "📒 Задачники"}, {"text": "👨‍👧 Код для семьи"}],
+        [{"text": "❓ Помощь"}],
+    ], "resize_keyboard": True}
+
+# кнопки-ярлыки -> команды
+BUTTON_CMDS = {
+    "📋 Мои задачи": "/tasks",
+    "📊 Отчёт": "/report",
+    "👨‍👧 Код для семьи": "/code",
+    "📒 Задачники": "/notebooks",
+    "❓ Помощь": "/help",
+}
+
+# голосовые/текстовые синонимы команд
+CMD_SYNONYMS = {
+    "/tasks": ["мои задачи", "покажи задачи", "покажи все задачи", "просмотреть задачи",
+               "посмотреть задачи", "что у меня", "список задач", "все задачи",
+               "что сегодня", "план на сегодня", "что надо сделать", "мой список"],
+    "/report": ["отчёт", "отчет", "итоги", "что сделано", "покажи отчет", "покажи отчёт", "статистика"],
+    "/help": ["помощь", "команды", "что умеешь", "помоги", "справка"],
+    "/code": ["код для семьи", "дай код", "код семье", "подключить семью", "код семьи"],
+    "/ideas": ["мои идеи", "идеи", "заметки", "мои заметки", "что записал"],
+    "/shop": ["что купить", "покупки", "список покупок", "что в магазин", "магазин"],
+    "/notebooks": ["мои задачники", "какие задачники", "список задачников", "какие списки"],
+}
+
+def match_cmd(text):
+    """Ищет команду по синониму. Работает и для голоса после STT."""
+    t = re.sub(r"[.!,?]", "", text.lower().strip())
+    for cmd, phrases in CMD_SYNONYMS.items():
+        for ph in phrases:
+            if t == ph or t.startswith(ph + " ") or (len(ph) > 6 and ph in t):
+                return cmd
+    return None
+
+# ============ 2) КАТЕГОРИИ ЗАДАЧ ============
+CATS = [
+    ("🛒", "покупка", ["купить", "заказать", "приобрести", "закупить"]),
+    ("📞", "звонок", ["позвонить", "набрать", "перезвонить"]),
+    ("💧", "здоровье", ["воду", "воды", "попить"]),
+    ("💊", "здоровье", ["лекарств", "таблетк", "пилюл"]),
+    ("💡", "идея", ["идея", "придумал", "записать"]),
+]
+
+def detect_cat(text):
+    for icon, cat, words in CATS:
+        if any(w in text for w in words):
+            return icon, cat
+    return "🗒️", "дело"
+
 def send_voice(chat, text):
     from gtts import gTTS
     with tempfile.TemporaryDirectory() as td:
@@ -118,79 +151,13 @@ def send_voice(chat, text):
             with open(ogg, "rb") as f:
                 tg_file("sendVoice", "voice", f.read(), "v.ogg", chat_id=chat)
 
-# ---- клавиатуры ----
 def kb(rows):
-    return {"inline_keyboard": [[{"text": t, "callback_data": cd} for t, cd in row] for row in rows]}
+    return {"inline_keyboard": [[{"text": t, "callback_data": d} for t, d in row] for row in rows]}
 
 def kb_task(tid):
-    return kb([
-        [("✅ Сделал", f"done:{tid}"), ("⏰ +15 мин", f"snz:{tid}:15"), ("⏰ +1 час", f"snz:{tid}:60")],
-        [("🗑 Удалить", f"del:{tid}")],
-    ])
+    return kb([[("✅ Сделал", f"done:{tid}"), ("⏰ +15 мин", f"snz:{tid}:15"), ("⏰ +1 час", f"snz:{tid}:60")]])
 
-def kb_confirm(mode):
-    return kb([[("✔ Да, очистить", f"clr:{mode}:yes"), ("✖ Отмена", f"clr:{mode}:no")]])
-
-def main_kb():
-    return {"keyboard": [
-        [{"text": "📋 Мои задачи"}, {"text": "🛒 Покупки"}],
-        [{"text": "💡 Мои идеи"}, {"text": "📊 Отчёт"}],
-        [{"text": "📒 Задачники"}, {"text": "❓ Помощь"}],
-    ], "resize_keyboard": True}
-
-BUTTON_CMDS = {
-    "📋 Мои задачи": "/tasks", "🛒 Покупки": "/shop",
-    "💡 Мои идеи": "/ideas", "📊 Отчёт": "/report",
-    "📒 Задачники": "/notebooks", "❓ Помощь": "/help",
-}
-
-# ================== КОМАНДЫ-СИНОНИМЫ (текст и голос) ==================
-CMD_SYNONYMS = {
-    "/start": ["старт", "start", "начать", "начнем"],
-    "/tasks": ["мои задачи", "покажи задачи", "покажи все задачи", "просмотреть задачи",
-               "посмотреть задачи", "что у меня", "список задач", "все задачи",
-               "что сегодня", "план на сегодня", "что надо сделать", "мой список"],
-    "/report": ["отчёт", "отчет", "итоги", "что сделано", "покажи отчет", "покажи отчёт", "статистика"],
-    "/help": ["помощь", "команды", "что умеешь", "помоги", "справка"],
-    "/code": ["код для семьи", "дай код", "код семье", "подключить семью", "код семьи"],
-    "/ideas": ["мои идеи", "идеи", "заметки", "мои заметки", "что записал",
-               "мои записи", "важные записи", "мои номера", "что запомнил", "мои контакты"],
-    "/shop": ["что купить", "покупки", "список покупок", "что в магазин", "магазин", "список продуктов"],
-    "/notebooks": ["мои задачники", "какие задачники", "список задачников", "какие списки"],
-    "/clear_done": ["убрать выполненные", "очистить задачи", "убрать сделанное", "очистить список"],
-    "/clear_all": ["удалить все задачи", "удалить всё", "удалить все", "очистить всё",
-                   "обнулить задачник", "стереть всё", "очистить всё"],
-    "/clear_shop": ["убрать купленное", "очистить покупки", "удалить покупки"],
-    "/clear_ideas": ["очистить идеи", "удалить заметки", "удалить идеи", "очистить заметки"],
-    "/shop_done": ["куплено всё", "всё купил", "всё куплено", "купил всё"],
-}
-
-def match_cmd(text):
-    t = re.sub(r"[.!,?]", "", text.lower().strip())
-    for cmd, phrases in CMD_SYNONYMS.items():
-        for ph in phrases:
-            if t == ph or t.startswith(ph + " ") or (len(ph) > 6 and ph in t):
-                return cmd
-    return None
-
-# ================== КАТЕГОРИИ ==================
-CATS = [
-    ("🛒", "покупка", ["купить", "заказать", "приобрести", "закупить", "продукты"]),
-    ("📞", "звонок", ["позвонить", "набрать", "перезвонить"]),
-    ("💧", "здоровье", ["воду", "воды", "попить"]),
-    ("💊", "здоровье", ["лекарств", "таблетк", "пилюл"]),
-    ("💡", "идея", ["идея", "придумал", "записать", "запомни", "заметка", "запись",
-                    "номер", "телефон", "важно", "важное", "важная", "реквизит",
-                    "адрес", "контакт", "пин", "пароль", "код от", "секрет", "сохрани"]),
-]
-
-def detect_cat(text):
-    for icon, cat, words in CATS:
-        if any(w in text for w in words):
-            return icon, cat
-    return "🗒️", "дело"
-
-# ================== ПАРСЕР ВРЕМЕНИ ==================
+# ================== ПАРСЕР «ЧТО И КОГДА» ==================
 WD_STEMS = ["понедельник", "вторник", "сред", "четверг", "пятниц", "суббот", "воскресен"]
 NUMW = {"одиннадцать": 11, "двенадцать": 12, "один": 1, "одного": 1, "два": 2, "двух": 2,
         "три": 3, "трёх": 3, "трех": 3, "четыре": 4, "четырёх": 4, "четырех": 4,
@@ -205,6 +172,7 @@ def parse_task(raw):
     now = datetime.now()
     target = now.replace(second=0, microsecond=0)
     day_label = "сегодня"
+
     for i, stem in enumerate(WD_STEMS):
         mt = re.search(rf"(в[о]?\s*)?{stem}\w*", text)
         if mt:
@@ -220,6 +188,7 @@ def parse_task(raw):
             target += timedelta(days=2); day_label = "послезавтра"; text = text.replace("послезавтра", "")
         elif "завтра" in text:
             target += timedelta(days=1); day_label = "завтра"; text = text.replace("завтра", "")
+
     h = m = None
     hm = re.search(r"в\s+(\d{1,2})[:.](\d{2})", text)
     honly = re.search(r"\bв\s+(\d{1,2})\s*(часа?|часов)?\b", text)
@@ -270,43 +239,20 @@ def transcribe_voice(file_id: str) -> str:
             audio = rec.record(src)
         return rec.recognize_google(audio, language="ru-RU")
 
-# ================== ЗАДАЧИ ==================
-VERBS = ("купить", "заказать", "приобрести", "закупить")
-
-def make_task(u, text, due, day_label, icon, cat, source):
-    tid = int(time.time() * 1000) % 10**10 + len(u["tasks"])
-    u["tasks"].append({"id": tid, "text": text, "due": due.isoformat() if due else None,
+# ================== ЛОГИКА ЗАДАЧ ==================
+def add_task(d, user_id, text, source):
+    icon, cat = detect_cat(text)
+    ttext, due, day_label = parse_task(text)
+    if cat == "идея":
+        due, day_label = None, "заметка"   # идеи не напоминаем — просто храним
+    u = d["users"].setdefault(user_id, new_profile("Пользователь"))
+    tid = int(time.time() * 1000) % 10**10
+    u["tasks"].append({"id": tid, "text": ttext, "due": due.isoformat() if due else None,
                        "time": due.strftime("%H:%M") if due else "", "day_label": day_label,
                        "cat": cat, "icon": icon,
                        "done": False, "status": "pending", "last_fire": "",
                        "confirmed_at": "", "from": source})
-    return tid
-
-def add_tasks(d, owner_uid, text, source):
-    """Добавляет задачи. Покупки с запятыми -> отдельные пункты списка."""
-    icon, cat = detect_cat(text)
-    u = d["users"].setdefault(owner_uid, new_profile("Пользователь"))
-    created = []
-    if cat == "покупка":
-        parts = [p.strip() for p in re.split(r",| и ", text) if p.strip()]
-        items = []
-        for p in parts:
-            for v in VERBS:
-                if p.startswith(v + " "):
-                    p = p[len(v):].strip()
-            if len(p) > 1:
-                items.append(p)
-        if len(items) >= 2:
-            for it in items[:10]:
-                ttext, due, dl = parse_task(it)
-                tid = make_task(u, it, due, dl, "🛒", "покупка", source)
-                created.append((f"🛒 {it}", due, dl, tid))
-            return created
-    ttext, due, dl = parse_task(text)
-    if cat == "идея":
-        due, dl = None, "заметка"
-    tid = make_task(u, ttext, due, dl, icon, cat, source)
-    return [(f"{icon} {ttext}", due, dl, tid)]
+    return ttext, due, day_label, tid
 
 def repeat_minutes(u):
     try:
@@ -314,56 +260,6 @@ def repeat_minutes(u):
     except Exception:
         return 30
 
-def find_task(d, uid, tid):
-    u = d["users"].get(uid)
-    if u:
-        t = next((x for x in u["tasks"] if x["id"] == tid), None)
-        if t:
-            return u, t
-    for uu in d["users"].values():
-        if uid in uu.get("helpers", []):
-            t = next((x for x in uu["tasks"] if x["id"] == tid), None)
-            if t:
-                return uu, t
-    return None, None
-
-def render_lists(u, title="📋 Задачи"):
-    notes = [t for t in u["tasks"] if not t.get("due")]
-    timed = sorted([t for t in u["tasks"] if t.get("due")], key=lambda t: t["due"])
-    lines = [f"{title} — {u['name']}:"]
-    for t in timed[:20]:
-        lines.append(f"{'✅' if t['done'] else '•'} {t['day_label']} в {t['time']} — {t.get('icon','🗒️')} {t['text']}")
-    if notes:
-        lines.append("")
-        lines.append("💡 Идеи, номера и заметки:")
-        for t in notes[:20]:
-            lines.append(f"{'✅' if t['done'] else '•'} {t.get('icon','💡')} {t['text']}")
-    return "\n".join(lines)
-
-CLEAR_TEXT = {
-    "done": "все выполненные задачи",
-    "all": "ВСЕ задачи и заметки",
-    "shop": "все покупки",
-    "ideas": "все идеи и заметки",
-}
-
-def do_clear(d, owner_uid, mode):
-    u = d["users"].get(owner_uid)
-    if not u:
-        return 0
-    before = len(u["tasks"])
-    if mode == "done":
-        u["tasks"] = [t for t in u["tasks"] if not t["done"]]
-    elif mode == "all":
-        u["tasks"] = []
-    elif mode == "shop":
-        u["tasks"] = [t for t in u["tasks"] if t.get("cat") != "покупка"]
-    elif mode == "ideas":
-        u["tasks"] = [t for t in u["tasks"] if t.get("due")]
-    save_data(d)
-    return before - len(u["tasks"])
-
-# ================== КОМАНДЫ ==================
 def handle_command(d, uid, chat, text, username=None):
     u = d["users"].get(uid)
     if text == "/start":
@@ -372,63 +268,64 @@ def handle_command(d, uid, chat, text, username=None):
         if username:
             d["users"][uid]["username"] = username
         save_data(d)
-        send(chat, "👋 Привет! Я — «Мой день» — напоминалка и семейный задачник.\n\n"
-                   "Просто напишите или продиктуйте голосом:\n"
-                   "«купить молоко, хлеб и яйца» — список покупок\n"
-                   "«позвонить Ване в шесть вечера» — напоминание\n"
-                   "«запомни номер Вани 8911...» — тихая заметка\n"
-                   "«выпить воды» — напомню через 30 минут\n\n"
-                   "Кнопки внизу 👇 — быстрый доступ.", rkb=main_kb())
+        u = d["users"][uid]
+        send(chat, "👋 Привет! Я — «Мой день».\n\nПросто напишите или продиктуйте голосом:\n"
+                   "«купить молоко завтра в 10»\n«позвонить Ване в шесть вечера»\n«выпить воды» — через 30 минут\n\n"
+                   "Кнопки внизу 👇 помогут быстро управлять задачами.", rkb=main_kb())
         return True
     if text == "/help":
-        send(chat, "❓ Что я умею\n\n"
-                   "📌 ЗАДАЧИ И НАПОМИНАНИЯ\n"
-                   "• Любое сообщение — новая задача\n"
-                   "• Понимаю: «завтра», «в среду», «в 6 вечера»\n"
-                   "• Время не назвали — через 30 минут\n"
-                   "• Кнопки под задачей: ✅ Сделал, ⏰ Отложить, 🗑 Удалить\n"
-                   "• /repeat 20 — как часто повторять (минут)\n\n"
-                   "🛒 ПОКУПКИ\n"
-                   "• «купить молоко, хлеб и яйца» — разложу по пунктам\n"
-                   "• «что купить» — список; «куплено всё» — закрыть всё\n\n"
-                   "💡 ЗАМЕТКИ\n"
-                   "• «запомни...», «важно...», «номер...», «адрес...» — без напоминаний\n"
-                   "• «мои идеи» — посмотреть записи\n\n"
-                   "📒 ЗАДАЧНИКИ\n"
-                   "• «задачник Дядя» / «мой задачник» — переключение\n"
-                   "• /code → семья пишет /link 1234 → /share_on — общий задачник\n\n"
-                   "💬 СООБЩЕНИЯ\n"
-                   "• «скажи Дядя позвонить маме» — передам от вашего имени\n\n"
-                   "🧹 ОЧИСТКА\n"
-                   "• «убрать выполненные», «убрать купленное», «очистить идеи», «удалить всё»\n"
-                   "• Если 3 раза не подтвердил задачу — оповещу семью")
+        send(chat, "❓ Помощь\n\n"
+                   "• Любое сообщение — это новая задача\n"
+                   "• «купить...» — в список покупок, «идея...» — в заметки\n"
+                   "• Голосом: «мои задачи», «что сегодня», «что купить», «мои идеи»\n"
+                   "• /share_on — общий задачник для семьи\n"
+                   "• Несколько задачников: «задачник дяди», «мой задачник», /notebooks\n"
+                   "• Передать сообщение: «скажи Иван купить молоко»\n"
+                   "• Если 3 раза не подтверждено — бот оповещает семью\n"
+                   "• «завтра», «в среду», «в 6 вечера» — понимаю дату и время\n"
+                   "• Время не назвали — напомню через 30 минут\n"
+                   "• К задачам прикреплены кнопки: ✅ Сделал, ⏰ Отложить\n"
+                   "• /repeat 20 — как часто повторять напоминания (минуты)\n"
+                   "• /code — дать семье доступ к вашим задачам\n"
+                   "• /report — отчёт за день\n\n"
+                   "Семья получает ваш отчёт каждый день в 21:00.")
         return True
     if not u:
         send(chat, "Сначала /start")
         return True
     if text in ("/tasks", "/ideas", "/shop"):
-        u2 = d["users"][active_owner(d, uid)]
-        ts = u2["tasks"]
+        u = d["users"][active_owner(d, uid)]
+        ts = u["tasks"]
         if text == "/shop":
             ts = [t for t in ts if t.get("cat") == "покупка"]
+        notes = [t for t in ts if not t.get("due")]
+        timed = sorted([t for t in ts if t.get("due")], key=lambda t: t["due"])
         if text == "/ideas":
-            ts = [t for t in ts if not t.get("due")]
-        if not ts:
-            send(chat, "Здесь пока пусто ✨", rkb=main_kb())
+            timed = []
+        if not timed and not notes:
+            send(chat, "Здесь пока пусто. Напишите или продиктуйте — и я запомню!")
             return True
-        send(chat, render_lists(u2, "🛒 Покупки" if text == "/shop" else ("💡 Идеи и заметки" if text == "/ideas" else "📋 Задачи")), rkb=main_kb())
+        lines = []
+        if timed:
+            lines.append("📋 Задачи:" if text != "/shop" else "🛒 Покупки:")
+            for t in timed[:15]:
+                lines.append(f"{'✅' if t['done'] else '•'} {t['day_label']} в {t['time']} — {t.get('icon','🗒️')} {t['text']}")
+        if notes:
+            lines.append("")
+            lines.append("💡 Идеи и заметки:")
+            for t in notes[:15]:
+                lines.append(f"{'✅' if t['done'] else '•'} {t.get('icon','💡')} {t['text']}")
+        send(chat, "\n".join(lines), rkb=main_kb())
         return True
     if text == "/report":
-        u2 = d["users"][active_owner(d, uid)]
-        done = [t for t in u2["tasks"] if t["done"]]
-        lines = [f"📋 Отчёт за {datetime.now().strftime('%d.%m.%Y')} — {u2['name']}:"]
-        for t in sorted(u2["tasks"], key=lambda x: (x.get("due") or "9999")):
-            mark = "✅" if t["done"] else "⬜"
-            when = f"{t['day_label']} {t['time']}" if t.get("due") else "заметка"
-            lines.append(f"{mark} {when} — {t.get('icon','🗒️')} {t['text']}"
+        u = d["users"][active_owner(d, uid)]
+        done = [t for t in u["tasks"] if t["done"]]
+        lines = [f"📋 Отчёт за {datetime.now().strftime('%d.%m.%Y')} — {u['name']}:"]
+        for t in sorted(u["tasks"], key=lambda x: x["due"]):
+            lines.append(f"{'✅' if t['done'] else '⬜'} {t['day_label']} {t['time']} — {t['text']}"
                          + (f" ({t['confirmed_at']})" if t["done"] else ""))
-        lines.append(f"Итог: {len(done)}/{len(u2['tasks'])}")
-        send(chat, "\n".join(lines), rkb=main_kb())
+        lines.append(f"Итог: {len(done)}/{len(u['tasks'])}")
+        send(chat, "\n".join(lines))
         return True
     if text == "/code":
         import random
@@ -450,7 +347,7 @@ def handle_command(d, uid, chat, text, username=None):
         if uid not in pu["helpers"]:
             pu["helpers"].append(uid)
         save_data(d)
-        send(chat, f"🤝 Вы подключены к «{pu['name']}».\nПишите мне задачи — я передам. «мои задачи» — увидеть список. /unlink — отключиться.")
+        send(chat, f"🤝 Вы подключены к «{pu['name']}». Пишите мне задачи текстом — я передам. /report — отчёт. /unlink — отключиться.")
         return True
     if text == "/unlink":
         n = 0
@@ -459,6 +356,28 @@ def handle_command(d, uid, chat, text, username=None):
                 uu["helpers"].remove(uid); n += 1
         save_data(d)
         send(chat, "Отключено" if n else "Вы ни к кому не подключены")
+        return True
+    if text == "/notebooks":
+        acc = accessible(d, uid)
+        cur = active_owner(d, uid)
+        lines = ["📒 Ваши задачники:"]
+        for i, (ou, nm) in enumerate(acc, 1):
+            lines.append(f"{'▶️' if ou == cur else '•'} {i}. {nm}{' (общий)' if ou != uid else ''}")
+        lines.append("")
+        lines.append("Переключиться: «задачник дяди» или /use 2")
+        send(chat, "\n".join(lines), rkb=main_kb())
+        return True
+    if text.startswith("/use"):
+        parts = text.split()
+        acc = accessible(d, uid)
+        try:
+            ou, nm = acc[int(parts[1]) - 1]
+        except Exception:
+            send(chat, "Нет такого номера. Посмотрите: /notebooks")
+            return True
+        d["users"][uid]["active"] = ou if ou != uid else None
+        save_data(d)
+        send(chat, f"📒 Переключился на задачник «{nm}»", rkb=main_kb())
         return True
     if text == "/share_on":
         if not u.get("helpers"):
@@ -473,64 +392,41 @@ def handle_command(d, uid, chat, text, username=None):
         u["shared"] = False; save_data(d)
         send(chat, "🔒 Общий задачник выключен. Семья снова только добавляет задачи.")
         return True
-    if text == "/notebooks":
-        acc = accessible(d, uid)
-        cur = active_owner(d, uid)
-        lines = ["📒 Ваши задачники:"]
-        for i, (ou, nm) in enumerate(acc, 1):
-            lines.append(f"{'▶️' if ou == cur else '•'} {i}. {nm}{' (общий)' if ou != uid else ''}")
-        lines.append("")
-        lines.append("Переключиться: «задачник Дядя» или /use 2")
-        send(chat, "\n".join(lines), rkb=main_kb())
-        return True
-    if text.startswith("/use"):
-        parts = text.split()
-        acc = accessible(d, uid)
-        try:
-            ou, nm = acc[int(parts[1]) - 1]
-        except Exception:
-            send(chat, "Нет такого номера. Посмотрите: /notebooks")
-            return True
-        d["users"][uid]["active"] = ou if ou != uid else "self"
-        save_data(d)
-        send(chat, f"📒 Переключился на задачник «{nm}»", rkb=main_kb())
-        return True
     if text.startswith("/repeat"):
         parts = text.split()
         if len(parts) < 2 or not parts[1].isdigit():
             send(chat, "Напишите: /repeat 20")
             return True
         d["users"][active_owner(d, uid)]["repeat"] = int(parts[1]); save_data(d)
-        send(chat, f"✔ Буду напоминать каждые {parts[1]} минут, пока не подтвердите.", rkb=main_kb())
-        return True
-    if text in ("/clear_done", "/clear_all", "/clear_shop", "/clear_ideas"):
-        mode = text.split("_", 1)[1]
-        send(chat, f"🧹 Удалить {CLEAR_TEXT[mode]}?", kb=kb_confirm(mode))
-        return True
-    if text == "/shop_done":
-        owner = d["users"][active_owner(d, uid)]
-        n = 0
-        for t in owner["tasks"]:
-            if t.get("cat") == "покупка" and not t["done"]:
-                t["done"] = True; t["status"] = "done"
-                t["confirmed_at"] = datetime.now().strftime("%H:%M"); n += 1
-        save_data(d)
-        send(chat, f"✅ Отмечено купленным: {n} позиций", rkb=main_kb())
+        send(chat, f"✔ Буду напоминать каждые {parts[1]} минут, пока не подтвердите.")
         return True
     return False
 
-# ================== ОБРАБОТКА СООБЩЕНИЙ ==================
+# ================== ОБРАБОТКА ОБНОВЛЕНИЙ ==================
+def render_tasks_for(u, title="📋 Задачи"):
+    notes = [t for t in u["tasks"] if not t.get("due")]
+    timed = sorted([t for t in u["tasks"] if t.get("due")], key=lambda t: t["due"])
+    lines = [f"{title} — {u['name']}:"]
+    for t in timed[:15]:
+        lines.append(f"{'✅' if t['done'] else '•'} {t['day_label']} в {t['time']} — {t.get('icon','🗒️')} {t['text']}")
+    if notes:
+        lines.append("")
+        lines.append("💡 Идеи и заметки:")
+        for t in notes[:15]:
+            lines.append(f"{'✅' if t['done'] else '•'} {t.get('icon','💡')} {t['text']}")
+    return "\n".join(lines)
+
 def process_text(d, uid, chat, text, username=None):
     if text in BUTTON_CMDS:
         text = BUTTON_CMDS[text]
     low = text.lower().strip()
-    # передать сообщение от моего имени
+    # --- передать сообщение от моего имени ---
     if low.startswith(("скажи ", "передай ", "напиши ")):
         parts = text.split(maxsplit=2)
         if len(parts) >= 3:
             name = parts[1].lstrip("@").lower()
             target = next((k for k, v in d["users"].items()
-                           if name_match(name, v.get("name", ""))
+                           if name in v.get("name", "").lower()
                            or name == str(v.get("username") or "").lower()), None)
             if target:
                 sender = d["users"].get(uid, {}).get("name", "Кто-то")
@@ -541,72 +437,45 @@ def process_text(d, uid, chat, text, username=None):
         else:
             send(chat, "Формат: скажи Иван купить молоко")
         return
-    # переключение задачника
-    if low in ("мой задачник", "моя записная", "к своему задачнику"):
-        d["users"].setdefault(uid, new_profile("Я"))["active"] = "self"
-        save_data(d)
-        send(chat, "📒 Теперь работаем с вашим задачником", rkb=main_kb())
-        return
+    # --- переключение задачника ---
     if low.startswith("задачник "):
         name = low[9:].strip()
         acc = accessible(d, uid)
         target = uid if name in ("мой", "моё") else None
         if target is None:
             for ou, nm in acc:
-                if name_match(name, nm):
+                if name in nm.lower():
                     target = ou
                     break
         if target is not None:
-            d["users"].setdefault(uid, new_profile("Я"))["active"] = target if target != uid else "self"
+            d["users"].setdefault(uid, new_profile("Я"))["active"] = target if target != uid else None
             save_data(d)
             send(chat, f"📒 Теперь работаем с задачником «{d['users'][target]['name']}»", rkb=main_kb())
         else:
             send(chat, "Такой задачник не найден. Смотрите: /notebooks")
         return
     helper_of = next((k for k, v in d["users"].items() if uid in v.get("helpers", [])), None)
-    if helper_of and not own_mode(d, uid):
+    if helper_of:
         cmd = match_cmd(text)
-        target = active_owner(d, uid)
-        owner = d["users"][target]
-        if cmd in ("/tasks", "/ideas", "/shop", "/notebooks"):
-            send(chat, render_lists(owner, f"📋 Задачи «{owner['name']}»"), rkb=main_kb())
+        owner = d["users"][helper_of]
+        if cmd in ("/tasks", "/ideas", "/shop"):
+            send(chat, render_tasks_for(owner), rkb=main_kb())
             return
         if cmd == "/report":
             done = sum(1 for t in owner["tasks"] if t["done"])
             send(chat, f"📋 {owner['name']}: {done}/{len(owner['tasks'])} выполнено. Не выполнено: {len(owner['tasks'])-done}.")
             return
-        if cmd in ("/clear_done", "/clear_all", "/clear_shop", "/clear_ideas"):
-            mode = cmd.split("_", 1)[1]
-            send(chat, f"🧹 Удалить {CLEAR_TEXT[mode]} «{owner['name']}»?", kb=kb_confirm(mode))
-            return
-        if cmd == "/shop_done":
-            n = 0
-            for t in owner["tasks"]:
-                if t.get("cat") == "покупка" and not t["done"]:
-                    t["done"] = True; t["status"] = "done"
-                    t["confirmed_at"] = datetime.now().strftime("%H:%M"); n += 1
-            save_data(d)
-            send(chat, f"✅ Отмечено купленным: {n} позиций", rkb=main_kb())
-            return
         if not text.startswith("/"):
-            created = add_tasks(d, target, text, "helper")
+            ttext, due, dl, tid = add_task(d, helper_of, text, "helper")
             save_data(d)
-            if len(created) > 1:
-                lines = [f"✔ Передал список ({len(created)} позиций):"] + [c[0] for c in created]
-                send(chat, "\n".join(lines))
-                for label, due, dl, tid in created:
-                    when = f"{dl} в {due.strftime('%H:%M')}" if due else dl
-                    send(helper_of, f"📌 {label}\n{when}", kb=kb_task(tid))
-            else:
-                label, due, dl, tid = created[0]
-                when = f"{dl} в {due.strftime('%H:%M')}" if due else dl
-                send(chat, f"✔ Передал: {label} ({when})")
-                send(helper_of, f"📌 Новая задача от семьи: {label}\n{when}", kb=kb_task(tid))
-                if SEND_VOICE:
-                    try:
-                        send_voice(helper_of, f"Новая задача от семьи: {label}")
-                    except Exception:
-                        pass
+            when = f"{dl} в {due.strftime('%H:%M')}" if due else dl
+            send(chat, f"✔ Передал: {ttext} ({when})")
+            send(helper_of, f"📌 Новая задача от семьи: {ttext}\n{when}", kb=kb_task(tid))
+            if SEND_VOICE:
+                try:
+                    send_voice(helper_of, f"Новая задача от семьи: {ttext}")
+                except Exception:
+                    pass
             return
     cmd = match_cmd(text)
     if cmd and not text.startswith("/"):
@@ -615,21 +484,16 @@ def process_text(d, uid, chat, text, username=None):
     if text.startswith("/"):
         if handle_command(d, uid, chat, text.split("@")[0], username):
             return
-    # новая задача (или список покупок)
-    created = add_tasks(d, active_owner(d, uid), text, "self")
+    # обычная задача -> в активный задачник
+    ttext, due, dl, tid = add_task(d, active_owner(d, uid), text, "self")
     save_data(d)
-    if len(created) > 1:
-        lines = [f"🛒 Добавил {len(created)} позиций:"] + [c[0] for c in created]
-        send(chat, "\n".join(lines), rkb=main_kb())
-    else:
-        label, due, dl, tid = created[0]
-        when = f"{dl} в {due.strftime('%H:%M')}" if due else dl
-        send(chat, f"📌 {label}\n{when}", kb=kb_task(tid))
-        if SEND_VOICE:
-            try:
-                send_voice(chat, f"Добавлено: {label}. {when}.")
-            except Exception as e:
-                log.warning(f"TTS: {e}")
+    when = f"{dl} в {due.strftime('%H:%M')}" if due else dl
+    send(chat, f"📌 {ttext}\n{when}", kb=kb_task(tid))
+    if SEND_VOICE:
+        try:
+            send_voice(chat, f"Добавлено: {ttext}. {when}.")
+        except Exception as e:
+            log.warning(f"TTS: {e}")
 
 def handle_message(d, msg):
     uid = str(msg["from"]["id"])
@@ -652,54 +516,50 @@ def handle_message(d, msg):
         send(chat, f"🎤 Распознал: «{text}»")
         process_text(d, uid, chat, text, username)
 
-# ================== КНОПКИ ==================
+def find_task(d, uid, tid):
+    """Задача у самого юзера, а если он помощник — у хозяина (общий задачник)."""
+    u = d["users"].get(uid)
+    if u:
+        t = next((x for x in u["tasks"] if x["id"] == tid), None)
+        if t:
+            return u, t
+    for uu in d["users"].values():
+        if uid in uu.get("helpers", []):
+            t = next((x for x in uu["tasks"] if x["id"] == tid), None)
+            if t:
+                return uu, t
+    return None, None
+
 def handle_callback(d, cb):
     uid = str(cb["from"]["id"])
     data = cb["data"]
     tg("answerCallbackQuery", callback_query_id=cb["id"])
     parts = data.split(":")
     if parts[0] == "done":
-        u, t = find_task(d, uid, int(parts[1]))
+        tid = int(parts[1])
+        u, t = find_task(d, uid, tid)
         if not t:
             return
-        t["done"] = True; t["status"] = "done"; t["fires"] = 0
-        t["confirmed_at"] = datetime.now().strftime("%H:%M")
-        save_data(d)
-        tg("editMessageText", chat_id=cb["message"]["chat"]["id"],
-           message_id=cb["message"]["message_id"],
-           text=f"✅ {t['text']} — выполнено в {t['confirmed_at']}")
-    elif parts[0] == "snz":
-        u, t = find_task(d, uid, int(parts[1]))
-        if not t:
-            return
-        mins = int(parts[2])
-        t["status"] = "snoozed"
-        t["snooze_until"] = (datetime.now() + timedelta(minutes=mins)).isoformat()
-        save_data(d)
-        tg("editMessageText", chat_id=cb["message"]["chat"]["id"],
-           message_id=cb["message"]["message_id"],
-           text=f"⏰ «{t['text']}» — напомню через {mins} мин")
-    elif parts[0] == "del":
-        u, t = find_task(d, uid, int(parts[1]))
-        if not t:
-            return
-        u["tasks"] = [x for x in u["tasks"] if x["id"] != t["id"]]
-        save_data(d)
-        tg("editMessageText", chat_id=cb["message"]["chat"]["id"],
-           message_id=cb["message"]["message_id"],
-           text=f"🗑 «{t['text']}» — удалено")
-    elif parts[0] == "clr":
-        mode, answer = parts[1], parts[2]
-        owner = active_owner(d, uid)
-        if answer == "no":
+        if t:
+            t["done"] = True; t["status"] = "done"
+            t["fires"] = 0
+            t["confirmed_at"] = datetime.now().strftime("%H:%M")
+            save_data(d)
             tg("editMessageText", chat_id=cb["message"]["chat"]["id"],
-               message_id=cb["message"]["message_id"], text="✖ Очистка отменена")
+               message_id=cb["message"]["message_id"],
+               text=f"✅ {t['text']} — выполнено в {t['confirmed_at']}")
+    elif parts[0] == "snz":
+        tid, mins = int(parts[1]), int(parts[2])
+        u, t = find_task(d, uid, tid)
+        if not t:
             return
-        n = do_clear(d, owner, mode)
-        save_data(d)
-        tg("editMessageText", chat_id=cb["message"]["chat"]["id"],
-           message_id=cb["message"]["message_id"],
-           text=f"🧹 Удалено позиций: {n}")
+        if t:
+            t["status"] = "snoozed"
+            t["snooze_until"] = (datetime.now() + timedelta(minutes=mins)).isoformat()
+            save_data(d)
+            tg("editMessageText", chat_id=cb["message"]["chat"]["id"],
+               message_id=cb["message"]["message_id"],
+               text=f"⏰ «{t['text']}» — напомню через {mins} мин")
 
 # ================== ПЛАНИРОВЩИК ==================
 def scheduler_tick(d):
@@ -717,25 +577,25 @@ def scheduler_tick(d):
                 else:
                     continue
             if not t.get("due"):
-                continue
+                continue  # идеи/заметки не напоминаем
             due = datetime.fromisoformat(t["due"])
             if due.date() != now.date():
                 continue
             last = datetime.fromisoformat(t["last_fire"]) if t["last_fire"] else None
             if now >= due and (last is None or (now - last).total_seconds() >= repeat_minutes(u) * 60):
-                t["status"] = "overdue"; t["last_fire"] = now.isoformat()
+                t["status"] = "overdue"; t["last_fire"] = now.isoformat(); changed = True
                 t["fires"] = t.get("fires", 0) + 1
-                changed = True
                 send(int(k), f"🔔 {t['text']}\nПора! Повторяю каждые {repeat_minutes(u)} мин, пока не подтвердите.",
                      kb=kb_task(t["id"]))
+                if t["fires"] == 3 and u.get("helpers"):
+                    for h in u["helpers"]:
+                        send(int(h), f"⚠️ ВНИМАНИЕ: «{t['text']}» ({u['name']}) не подтверждается уже 3 раза. Может, позвоните?")
                 if SEND_VOICE:
                     try:
                         send_voice(int(k), f"Напоминаю: {t['text']}")
                     except Exception as e:
                         log.warning(f"TTS: {e}")
-                if t["fires"] == 3 and u.get("helpers"):
-                    for h in u["helpers"]:
-                        send(int(h), f"⚠️ ВНИМАНИЕ: «{t['text']}» ({u['name']}) не подтверждается уже 3 раза. Может, позвоните?")
+        # отчёт помощникам в 21:00
         if now.strftime("%H:%M") == "21:00" and u["tasks"] and not u.get("_rep_" + now.strftime("%d%m")):
             done = sum(1 for t in u["tasks"] if t["done"])
             for h in u.get("helpers", []):
@@ -744,7 +604,7 @@ def scheduler_tick(d):
     if changed:
         save_data(d)
 
-# ================== HEALTH / MAIN ==================
+# ================== HEALTH (для хостингов с пингом) ==================
 def run_health():
     port = int(os.environ.get("PORT", 0))
     if not port:
@@ -758,6 +618,7 @@ def run_health():
     threading.Thread(target=lambda: HTTPServer(("0.0.0.0", port), H).serve_forever(),
                      daemon=True).start()
 
+# ================== ГЛАВНЫЙ ЦИКЛ ==================
 def main():
     if BOT_TOKEN.startswith("ВСТАВЬ"):
         raise SystemExit("Укажите BOT_TOKEN: export BOT_TOKEN=...")
@@ -772,14 +633,13 @@ def main():
             if time.time() - last_check >= CHECK_SEC:
                 last_check = time.time()
                 scheduler_tick(d)
+            # раз в сутки чистим старые выполненные задачи
             if datetime.now().date() != last_save_day:
                 last_save_day = datetime.now().date()
                 for u in d["users"].values():
-                    u["tasks"] = [t for t in u["tasks"]
-                                  if not t["done"] or (t.get("due") and t["due"][:10] >= str(last_save_day))]
+                    u["tasks"] = [t for t in u["tasks"] if not t["done"] or (t.get("due") and t["due"][:10] >= str(last_save_day))]
                     for k in list(u.keys()):
-                        if k.startswith("_rep_"):
-                            del u[k]
+                        if k.startswith("_rep_"): del u[k]
                 save_data(d)
             res = tg("getUpdates", offset=offset, timeout=25)
             for upd in res.get("result", []):
